@@ -56,7 +56,7 @@ grammar, rejected by the binder with a clear error), **no**.
 | G015 | `ALL` path search | partial | Single-edge patterns are correct. With a quantifier the result is one row per endpoint pair that some walk within the bounds connects |
 | G016 | `ANY [k]` | no | |
 | G017 | `ALL SHORTEST` | parse | |
-| G018 | `ANY SHORTEST` | yes | With bounds, the shortest walk whose length lies within them (9.8), found by `shortestpathbounded()`; a vertex can reach itself through a cycle |
+| G018 | `ANY SHORTEST` | partial | With bounds, the shortest walk whose length lies within them (9.8), found by `shortestpathbounded()`; a vertex can reach itself through a cycle. Two cases still return more than one row per endpoint pair: a pattern with two quantified edges (one row per intermediate vertex), and a single edge without a quantifier over parallel edges (one row per edge) |
 | G019 | `SHORTEST k` | parse | |
 | G020 | `SHORTEST k GROUP` | no | |
 | G030 to G033 | Path alternation `\|`, `\|+\|` | no | |

@@ -1,6 +1,8 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckpgq/common.hpp"
 #include "duckpgq/core/functions/function_data/iterative_length_function_data.hpp"
 
@@ -209,100 +211,195 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 
 //------------------------------------------------------------------------------
 // shortestpathbounded(csr_id, v_size, src, dst, lower, upper)
+// iterativelengthbounded(csr_id, v_size, src, dst, lower, upper)
 //
-// Returns the shortest walk from src to dst whose length lies in [lower, upper], as the same list of alternating
-// vertex and edge ids that shortestpath() returns, or NULL when no such walk exists. Walks may revisit vertices, so
-// a source reaches itself through a cycle when lower > 0.
+// shortestpathbounded returns the shortest walk from src to dst whose length lies in [lower, upper], as the same list
+// of alternating vertex and edge ids that shortestpath() returns, or NULL when no such walk exists.
+// iterativelengthbounded runs the same search and returns only the length of that walk (or NULL), without storing
+// parents; it is the filter, shortestpathbounded builds the path for the rows that pass it. Walks may revisit
+// vertices, so a source reaches itself through a cycle when lower > 0.
 //
 // Every walk of length >= lower passes, after exactly lower steps, through a vertex of F_lower (the vertices reachable
 // in exactly lower steps). The search therefore expands the exact-length frontiers F_0 .. F_lower without pruning,
-// keeping one parent per vertex and level, and then runs an ordinary BFS from F_lower up to the upper bound.
+// keeping one parent per frontier entry, and then runs an ordinary BFS from F_lower up to the upper bound.
+// iterativelengthbounded runs this search for up to LANE_LIMIT sources at once, one bitset lane per source, as
+// iterativelength() does; with a single source it uses the single-source search, which is kept between chunks.
 //------------------------------------------------------------------------------
 namespace {
 
 struct BoundedSearch {
+	explicit BoundedSearch(bool store_paths_p) : store_paths(store_paths_p) {
+	}
+
+	//! Whether parents are stored, so that Reconstruct can be called (shortestpathbounded) or not
+	//! (iterativelengthbounded).
+	const bool store_paths;
+
+	//! The last search, which is reused while consecutive rows share the source and bounds.
+	bool has_search = false;
+	int64_t v_size = -1;
+	int64_t src = -1;
 	int64_t lower = 0;
 	int64_t upper = 0;
-	//! Parents per level of the exact-length phase: level_parent_v[k][v] is the predecessor of v at level k + 1.
-	vector<vector<int64_t>> level_parent_v;
-	vector<vector<int64_t>> level_parent_e;
+
+	//! Per-vertex buffers of size v_size, kept between searches.
+	//! stamp[n] == generation: n is already in the frontier being built.
+	vector<idx_t> stamp;
+	idx_t generation = 0;
+	//! CSR position through which n entered the level being built, and the index of its parent in the previous level.
+	vector<int64_t> pending_pos;
+	vector<int64_t> pending_parent;
+	//! Index of n in F_lower.
+	vector<int64_t> index_in_lower;
 	//! BFS phase from F_lower: distance beyond lower (-1 = not reached) and parents.
 	vector<int64_t> bfs_dist;
 	vector<int64_t> bfs_parent_v;
 	vector<int64_t> bfs_parent_e;
+	//! Vertices whose bfs_dist was set, so that the next search resets only those.
+	vector<int64_t> bfs_touched;
 
-	void Run(int64_t v_size, const int64_t *v, const vector<int64_t> &e, const vector<int64_t> &edge_ids, int64_t src,
-	         int64_t lower_p, int64_t upper_p) {
+	//! Frontiers as sorted vertex lists. Sorting keeps the parent choice of a scan in vertex order.
+	vector<int64_t> frontier;
+	vector<int64_t> next;
+
+	//! Exact-length phase, stored only for the entries of each frontier: entry j of level k (1 <= k <= lower) is at
+	//! level_start[k - 1] + j. level_pos is the CSR position of the edge into the entry, so the entry's vertex is
+	//! e[level_pos] and its edge edge_ids[level_pos]; level_parent is the index of its parent in level k - 1.
+	vector<idx_t> level_start;
+	vector<int64_t> level_pos;
+	vector<int64_t> level_parent;
+
+	void Resize(int64_t v_size_p) {
+		v_size = v_size_p;
+		auto size = NumericCast<idx_t>(v_size);
+		stamp.assign(size, 0);
+		generation = 0;
+		bfs_dist.assign(size, -1);
+		bfs_touched.clear();
+		if (store_paths) {
+			pending_pos.assign(size, -1);
+			pending_parent.assign(size, -1);
+			index_in_lower.assign(size, -1);
+			bfs_parent_v.assign(size, -1);
+			bfs_parent_e.assign(size, -1);
+		}
+	}
+
+	void CheckMemory(ClientContext &context) const {
+		auto bytes =
+		    (level_pos.capacity() + level_parent.capacity()) * sizeof(int64_t) + level_start.capacity() * sizeof(idx_t);
+		auto limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+		if (bytes > limit) {
+			throw OutOfMemoryException("shortestpathbounded: the walks of length %lld from vertex %lld need more than "
+			                           "the memory limit (%llu bytes)",
+			                           lower, src, limit);
+		}
+	}
+
+	void Run(ClientContext &context, int64_t v_size_p, const int64_t *v, const vector<int64_t> &e,
+	         const vector<int64_t> &edge_ids, int64_t src_p, int64_t lower_p, int64_t upper_p) {
+		if (has_search && v_size == v_size_p && src == src_p && lower == lower_p && upper == upper_p) {
+			return;
+		}
+		has_search = false;
+		if (v_size != v_size_p) {
+			Resize(v_size_p);
+		} else {
+			for (auto n : bfs_touched) {
+				bfs_dist[n] = -1;
+			}
+			bfs_touched.clear();
+		}
+		src = src_p;
 		lower = lower_p;
 		upper = upper_p;
-		level_parent_v.clear();
-		level_parent_e.clear();
-		bfs_dist.assign(v_size, -1);
-		bfs_parent_v.assign(v_size, -1);
-		bfs_parent_e.assign(v_size, -1);
+		level_start.clear();
+		level_pos.clear();
+		level_parent.clear();
 
-		vector<bool> frontier(v_size, false);
-		vector<bool> next(v_size, false);
-		frontier[src] = true;
-		for (int64_t level = 0; level < lower; level++) {
-			vector<int64_t> parent_v(v_size, -1);
-			vector<int64_t> parent_e(v_size, -1);
-			bool any = false;
-			std::fill(next.begin(), next.end(), false);
-			for (int64_t u = 0; u < v_size; u++) {
-				if (!frontier[u]) {
-					continue;
-				}
+		frontier.clear();
+		frontier.push_back(src);
+		bool reached_lower = true;
+		for (int64_t level = 1; level <= lower; level++) {
+			context.InterruptCheck();
+			generation++;
+			next.clear();
+			for (idx_t i = 0; i < frontier.size(); i++) {
+				auto u = frontier[i];
 				for (auto pos = v[u]; pos < v[u + 1]; pos++) {
 					auto n = e[pos];
-					if (!next[n]) {
-						next[n] = true;
-						parent_v[n] = u;
-						parent_e[n] = edge_ids[pos];
-						any = true;
+					if (stamp[n] != generation) {
+						stamp[n] = generation;
+						next.push_back(n);
+						if (store_paths) {
+							pending_pos[n] = pos;
+							pending_parent[n] = NumericCast<int64_t>(i);
+						}
 					}
 				}
 			}
-			level_parent_v.push_back(std::move(parent_v));
-			level_parent_e.push_back(std::move(parent_e));
-			std::swap(frontier, next);
-			if (!any) {
-				return; // no walk is long enough
+			if (next.empty()) {
+				reached_lower = false; // no walk is long enough
+				break;
 			}
+			std::sort(next.begin(), next.end());
+			if (store_paths) {
+				level_start.push_back(level_pos.size());
+				for (auto n : next) {
+					level_pos.push_back(pending_pos[n]);
+					level_parent.push_back(pending_parent[n]);
+				}
+				CheckMemory(context);
+			}
+			std::swap(frontier, next);
+		}
+		has_search = true;
+		if (!reached_lower) {
+			return;
 		}
 
-		for (int64_t u = 0; u < v_size; u++) {
-			if (frontier[u]) {
-				bfs_dist[u] = 0;
+		for (idx_t i = 0; i < frontier.size(); i++) {
+			auto n = frontier[i];
+			bfs_dist[n] = 0;
+			bfs_touched.push_back(n);
+			if (store_paths) {
+				index_in_lower[n] = NumericCast<int64_t>(i);
 			}
 		}
-		for (int64_t extra = 1; lower + extra <= upper; extra++) {
-			bool any = false;
-			std::fill(next.begin(), next.end(), false);
-			for (int64_t u = 0; u < v_size; u++) {
-				if (!frontier[u]) {
-					continue;
-				}
+		for (int64_t extra = 1; extra <= upper - lower; extra++) {
+			context.InterruptCheck();
+			next.clear();
+			for (auto u : frontier) {
 				for (auto pos = v[u]; pos < v[u + 1]; pos++) {
 					auto n = e[pos];
 					if (bfs_dist[n] == -1) {
 						bfs_dist[n] = extra;
-						bfs_parent_v[n] = u;
-						bfs_parent_e[n] = edge_ids[pos];
-						next[n] = true;
-						any = true;
+						bfs_touched.push_back(n);
+						if (store_paths) {
+							bfs_parent_v[n] = u;
+							bfs_parent_e[n] = edge_ids[pos];
+						}
+						next.push_back(n);
 					}
 				}
 			}
-			std::swap(frontier, next);
-			if (!any) {
+			if (next.empty()) {
 				break;
 			}
+			std::sort(next.begin(), next.end());
+			std::swap(frontier, next);
 		}
 	}
 
+	//! Length of the shortest walk to dst within the bounds, or -1 if there is none.
+	int64_t Length(int64_t dst) const {
+		return bfs_dist[dst] == -1 ? -1 : lower + bfs_dist[dst];
+	}
+
 	//! Writes the walk to dst as [src, e, v, ..., e, dst]; returns false if dst is not reachable within the bounds.
-	bool Reconstruct(int64_t dst, vector<int64_t> &output) const {
+	bool Reconstruct(int64_t dst, const vector<int64_t> &e, const vector<int64_t> &edge_ids,
+	                 vector<int64_t> &output) const {
+		D_ASSERT(store_paths);
 		output.clear();
 		if (bfs_dist[dst] == -1) {
 			return false;
@@ -314,9 +411,12 @@ struct BoundedSearch {
 			current = bfs_parent_v[current];
 			output.push_back(current);
 		}
+		auto index = index_in_lower[current];
 		for (auto level = lower; level > 0; level--) {
-			output.push_back(level_parent_e[level - 1][current]);
-			current = level_parent_v[level - 1][current];
+			auto entry = level_start[level - 1] + NumericCast<idx_t>(index);
+			output.push_back(edge_ids[level_pos[entry]]);
+			index = level_parent[entry];
+			current = level == 1 ? src : e[level_pos[level_start[level - 2] + NumericCast<idx_t>(index)]];
 			output.push_back(current);
 		}
 		std::reverse(output.begin(), output.end());
@@ -324,9 +424,48 @@ struct BoundedSearch {
 	}
 };
 
-} // namespace
+//! Per-thread state of shortestpathbounded and iterativelengthbounded: the buffers and the last single-source search,
+//! kept between chunks, and for iterativelengthbounded the bitsets of the multi-source search.
+struct BoundedSearchLocalState : public FunctionLocalState {
+	explicit BoundedSearchLocalState(bool store_paths) : search(store_paths) {
+	}
+	BoundedSearch search;
+	vector<std::bitset<LANE_LIMIT>> visit;
+	vector<std::bitset<LANE_LIMIT>> next;
+	vector<std::bitset<LANE_LIMIT>> seen;
+};
 
-static void ShortestPathBoundedFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+unique_ptr<FunctionLocalState> InitBoundedPathState(ExpressionState &, const BoundFunctionExpression &,
+                                                    FunctionData *) {
+	return make_uniq<BoundedSearchLocalState>(true);
+}
+
+unique_ptr<FunctionLocalState> InitBoundedLengthState(ExpressionState &, const BoundFunctionExpression &,
+                                                      FunctionData *) {
+	return make_uniq<BoundedSearchLocalState>(false);
+}
+
+struct BoundedRow {
+	idx_t row;
+	int64_t src;
+	int64_t dst;
+	int64_t lower;
+	int64_t upper;
+};
+
+struct BoundedInput {
+	ClientContext &context;
+	shared_ptr<DuckPGQState> duckpgq_state;
+	int32_t csr_id;
+	int64_t v_size;
+	const int64_t *v;
+	const vector<int64_t> &e;
+	const vector<int64_t> &edge_ids;
+	//! The rows with a valid input; the result of every other row is set to NULL.
+	vector<BoundedRow> rows;
+};
+
+BoundedInput ReadBoundedInput(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &info = func_expr.BindInfo()->Cast<IterativeLengthFunctionData>();
 	auto duckpgq_state = GetDuckPGQState(info.context);
@@ -340,9 +479,8 @@ static void ShortestPathBoundedFunction(DataChunk &args, ExpressionState &state,
 		throw ConstraintException("Need to initialize CSR before doing shortest path");
 	}
 	int64_t v_size = args.data[1].GetValue(0).GetValue<int64_t>();
-	auto *v = reinterpret_cast<int64_t *>(csr->v);
-	vector<int64_t> &e = csr->e;
-	vector<int64_t> &edge_ids = csr->edge_ids;
+	BoundedInput input {info.context, duckpgq_state, info.csr_id, v_size, reinterpret_cast<int64_t *>(csr->v),
+	                    csr->e,       csr->edge_ids, {}};
 
 	UnifiedVectorFormat vdata_src, vdata_dst, vdata_lower, vdata_upper;
 	args.data[2].ToUnifiedFormat(vdata_src);
@@ -354,18 +492,7 @@ static void ShortestPathBoundedFunction(DataChunk &args, ExpressionState &state,
 	auto lower_data = reinterpret_cast<const int64_t *>(vdata_lower.data);
 	auto upper_data = reinterpret_cast<const int64_t *>(vdata_upper.data);
 
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetDataMutable<list_entry_t>(result);
 	ValidityMask &result_validity = FlatVector::ValidityMutable(result);
-
-	// Rows sharing a source and bounds share one search: visit them grouped.
-	struct Row {
-		idx_t row;
-		int64_t src;
-		int64_t lower;
-		int64_t upper;
-	};
-	vector<Row> rows;
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto src_pos = vdata_src.sel->get_index(i);
 		auto dst_pos = vdata_dst.sel->get_index(i);
@@ -384,28 +511,148 @@ static void ShortestPathBoundedFunction(DataChunk &args, ExpressionState &state,
 			result_validity.SetInvalid(i);
 			continue;
 		}
-		rows.push_back(Row {i, src, lower, upper});
+		input.rows.push_back(BoundedRow {i, src, dst, lower, upper});
 	}
-	std::stable_sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
-		if (a.src != b.src) {
-			return a.src < b.src;
+	return input;
+}
+
+//! Sorts the rows so that rows sharing a source and bounds are adjacent, with the group of the kept search first.
+void SortBoundedRows(vector<BoundedRow> &rows, const BoundedSearch &search, int64_t v_size) {
+	auto kept = [&](const BoundedRow &r) {
+		return search.has_search && search.v_size == v_size && r.src == search.src && r.lower == search.lower &&
+		       r.upper == search.upper;
+	};
+	std::stable_sort(rows.begin(), rows.end(), [&](const BoundedRow &a, const BoundedRow &b) {
+		auto a_kept = kept(a);
+		auto b_kept = kept(b);
+		if (a_kept != b_kept) {
+			return a_kept;
 		}
 		if (a.lower != b.lower) {
 			return a.lower < b.lower;
 		}
-		return a.upper < b.upper;
+		if (a.upper != b.upper) {
+			return a.upper < b.upper;
+		}
+		return a.src < b.src;
 	});
+}
 
-	BoundedSearch search;
+//! Multi-source version of BoundedSearch for iterativelengthbounded: up to LANE_LIMIT distinct sources with the same
+//! bounds, one bitset lane each. Writes the length of every row in rows[begin, end) or sets it to NULL.
+void BoundedLengthLanes(BoundedInput &input, BoundedSearchLocalState &state, idx_t begin, idx_t end,
+                        const vector<idx_t> &row_lane, int64_t *result_data, ValidityMask &result_validity) {
+	auto &rows = input.rows;
+	auto v_size = input.v_size;
+	auto *v = input.v;
+	auto &e = input.e;
+	auto &visit = state.visit;
+	auto &next = state.next;
+	auto &seen = state.seen;
+	if (visit.size() != NumericCast<idx_t>(v_size)) {
+		visit.assign(NumericCast<idx_t>(v_size), 0);
+		next.assign(NumericCast<idx_t>(v_size), 0);
+		seen.assign(NumericCast<idx_t>(v_size), 0);
+	}
+	auto lower = rows[begin].lower;
+	auto upper = rows[begin].upper;
+
+	for (int64_t n = 0; n < v_size; n++) {
+		visit[n] = 0;
+	}
+	for (idx_t i = begin; i < end; i++) {
+		visit[rows[i].src][row_lane[i - begin]] = true;
+	}
+
+	auto expand = [&]() {
+		bool any = false;
+		for (int64_t n = 0; n < v_size; n++) {
+			next[n] = 0;
+		}
+		for (int64_t u = 0; u < v_size; u++) {
+			if (visit[u].none()) {
+				continue;
+			}
+			any = true;
+			for (auto pos = v[u]; pos < v[u + 1]; pos++) {
+				next[e[pos]] |= visit[u];
+			}
+		}
+		std::swap(visit, next);
+		return any;
+	};
+
+	// Exact-length phase: no pruning, visit holds F_level per lane.
+	bool reached_lower = true;
+	for (int64_t level = 1; level <= lower; level++) {
+		input.context.InterruptCheck();
+		if (!expand()) {
+			reached_lower = false;
+			break;
+		}
+	}
+
+	vector<idx_t> unresolved;
+	if (reached_lower) {
+		for (int64_t n = 0; n < v_size; n++) {
+			seen[n] = visit[n];
+		}
+		for (idx_t i = begin; i < end; i++) {
+			if (seen[rows[i].dst][row_lane[i - begin]]) {
+				result_data[rows[i].row] = lower;
+			} else {
+				unresolved.push_back(i);
+			}
+		}
+		// BFS phase from F_lower.
+		for (int64_t extra = 1; extra <= upper - lower && !unresolved.empty(); extra++) {
+			input.context.InterruptCheck();
+			expand();
+			bool change = false;
+			for (int64_t n = 0; n < v_size; n++) {
+				visit[n] &= ~seen[n];
+				seen[n] |= visit[n];
+				change |= visit[n].any();
+			}
+			if (!change) {
+				break;
+			}
+			idx_t kept = 0;
+			for (auto i : unresolved) {
+				if (visit[rows[i].dst][row_lane[i - begin]]) {
+					result_data[rows[i].row] = lower + extra;
+				} else {
+					unresolved[kept++] = i;
+				}
+			}
+			unresolved.resize(kept);
+		}
+	} else {
+		for (idx_t i = begin; i < end; i++) {
+			unresolved.push_back(i);
+		}
+	}
+	for (auto i : unresolved) {
+		result_validity.SetInvalid(rows[i].row);
+	}
+}
+
+} // namespace
+
+static void ShortestPathBoundedFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto input = ReadBoundedInput(args, state, result);
+	auto &search = ExecuteFunctionState::GetFunctionState(state)->Cast<BoundedSearchLocalState>().search;
+	SortBoundedRows(input.rows, search, input.v_size);
+
+	auto result_data = FlatVector::GetDataMutable<list_entry_t>(result);
+	ValidityMask &result_validity = FlatVector::ValidityMutable(result);
 	vector<int64_t> output_vector;
 	uint64_t total_len = 0;
-	for (idx_t i = 0; i < rows.size(); i++) {
-		auto &row = rows[i];
-		if (i == 0 || rows[i - 1].src != row.src || rows[i - 1].lower != row.lower || rows[i - 1].upper != row.upper) {
-			search.Run(v_size, v, e, edge_ids, row.src, row.lower, row.upper);
-		}
-		auto dst = dst_data[vdata_dst.sel->get_index(row.row)];
-		if (!search.Reconstruct(dst, output_vector)) {
+	for (auto &row : input.rows) {
+		// Run returns at once while the source and bounds are those of the previous row.
+		search.Run(input.context, input.v_size, input.v, input.e, input.edge_ids, row.src, row.lower, row.upper);
+		if (!search.Reconstruct(row.dst, input.e, input.edge_ids, output_vector)) {
 			result_validity.SetInvalid(row.row);
 			continue;
 		}
@@ -418,7 +665,55 @@ static void ShortestPathBoundedFunction(DataChunk &args, ExpressionState &state,
 		ListVector::Append(result, ListVector::GetChild(*output), ListVector::GetListSize(*output));
 		total_len += result_data[row.row].length;
 	}
-	duckpgq_state->csr_to_delete.insert(info.csr_id);
+	input.duckpgq_state->csr_to_delete.insert(input.csr_id);
+}
+
+static void IterativeLengthBoundedFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto input = ReadBoundedInput(args, state, result);
+	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<BoundedSearchLocalState>();
+	auto &search = local_state.search;
+	SortBoundedRows(input.rows, search, input.v_size);
+
+	auto result_data = FlatVector::GetDataMutable<int64_t>(result);
+	ValidityMask &result_validity = FlatVector::ValidityMutable(result);
+	auto &rows = input.rows;
+	vector<idx_t> row_lane;
+	idx_t begin = 0;
+	while (begin < rows.size()) {
+		// Take the rows with the bounds of rows[begin], up to LANE_LIMIT distinct sources.
+		idx_t end = begin;
+		idx_t lanes = 0;
+		row_lane.clear();
+		while (end < rows.size() && rows[end].lower == rows[begin].lower && rows[end].upper == rows[begin].upper) {
+			if (lanes == 0 || rows[end].src != rows[end - 1].src) {
+				if (lanes == LANE_LIMIT) {
+					break;
+				}
+				lanes++;
+			}
+			row_lane.push_back(lanes - 1);
+			end++;
+		}
+		if (lanes == 1) {
+			// A single source: the single-source search is cheaper, and is kept for the next chunk.
+			for (idx_t i = begin; i < end; i++) {
+				auto &row = rows[i];
+				search.Run(input.context, input.v_size, input.v, input.e, input.edge_ids, row.src, row.lower,
+				           row.upper);
+				auto length = search.Length(row.dst);
+				if (length < 0) {
+					result_validity.SetInvalid(row.row);
+				} else {
+					result_data[row.row] = length;
+				}
+			}
+		} else {
+			BoundedLengthLanes(input, local_state, begin, end, row_lane, result_data, result_validity);
+		}
+		begin = end;
+	}
+	input.duckpgq_state->csr_to_delete.insert(input.csr_id);
 }
 
 //------------------------------------------------------------------------------
@@ -433,7 +728,14 @@ void CoreScalarFunctions::RegisterShortestPathScalarFunction(ExtensionLoader &lo
 	                                       {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT,
 	                                        LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	                                       LogicalType::LIST(LogicalType::BIGINT), ShortestPathBoundedFunction,
-	                                       IterativeLengthFunctionData::IterativeLengthBind));
+	                                       IterativeLengthFunctionData::IterativeLengthBind, nullptr,
+	                                       InitBoundedPathState));
+	loader.RegisterFunction(ScalarFunction("iterativelengthbounded",
+	                                       {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT,
+	                                        LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                                       LogicalType::BIGINT, IterativeLengthBoundedFunction,
+	                                       IterativeLengthFunctionData::IterativeLengthBind, nullptr,
+	                                       InitBoundedLengthState));
 }
 
 } // namespace duckdb
