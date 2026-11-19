@@ -1,6 +1,6 @@
 # SQL/PGQ grammar extension
 
-DuckPGQ adds its SQL/PGQ syntax through the `GrammarExtension` API of DuckDB v2.0-cyanoptera: `CREATE`, `DROP`,
+DuckPGQ adds its SQL/PGQ syntax through the `GrammarExtension` API of DuckDB v2.0-cyanoptera: `CREATE`, `ALTER`, `DROP`,
 `DESCRIBE`/`SHOW`, and `SUMMARIZE PROPERTY GRAPH`, and `GRAPH_TABLE`. DuckDB itself is not patched, no parser code is
 vendored, and the submodule points at upstream `duckdb/duckdb`.
 
@@ -46,6 +46,33 @@ vertex-key declarations, and arbitrary property expressions are not supported.
 
 Edge metadata stores resolved physical vertex names and qualification rather than statement-local aliases, so
 new connections can reconstruct graphs created with aliased references.
+
+### ALTER PROPERTY GRAPH
+
+The actions of SQL/PGQ 11.20 that fit DuckPGQ's model of one main label (plus discriminator sublabels) per element
+table:
+
+```sql
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (...) [ADD EDGE TABLES (...)];
+ALTER PROPERTY GRAPH g ADD EDGE TABLES (...);
+ALTER PROPERTY GRAPH g DROP {VERTEX | EDGE} TABLES (t, ...) [CASCADE | RESTRICT];
+ALTER PROPERTY GRAPH g ALTER {VERTEX | EDGE} TABLE t ALTER LABEL l ADD PROPERTIES (column [AS name], ...);
+ALTER PROPERTY GRAPH g ALTER {VERTEX | EDGE} TABLE t ALTER LABEL l DROP PROPERTIES (name, ...) [CASCADE | RESTRICT];
+```
+
+- Added element tables take the same definitions as in CREATE and are validated the same way, including the
+  incomplete-edge check for added edge tables. Edge tables may reference vertex tables already in the graph. A table
+  can be a vertex (or edge) table of a graph only once, and labels stay unique.
+- Element tables are named by table name, or by alias in the session that created the graph (aliases are not
+  persisted).
+- `DROP VERTEX TABLES` is `RESTRICT` by default: it fails while an edge table references the vertex table. `CASCADE`
+  also drops those edge tables. The last vertex table cannot be dropped; use `DROP PROPERTY GRAPH`.
+- Properties belong to the element table, so `l` may be the table's main label or one of its sublabels and the change
+  applies to all of them. `CASCADE` and `RESTRICT` on `DROP PROPERTIES` behave the same, since no graph object depends
+  on a property.
+- `ADD LABEL` and `DROP LABEL` are not supported. The statement is transformed into an `AlterPropertyGraphInfo`
+  (derived from `CreatePropertyGraphInfo`) and planned onto `AlterPropertyGraphFunction`, which builds the altered
+  definition from the registered graph and stores it the way `CREATE OR REPLACE` does.
 
 ### GRAPH_TABLE
 

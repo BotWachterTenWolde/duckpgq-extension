@@ -3,6 +3,7 @@
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
+#include "duckpgq/core/functions/table/alter_property_graph.hpp"
 #include "duckpgq/core/functions/table/create_property_graph.hpp"
 #include "duckpgq/core/functions/table/drop_property_graph.hpp"
 #include "duckpgq/core/utils/duckpgq_utils.hpp"
@@ -16,6 +17,14 @@ namespace duckdb {
 static ParserExtensionPlanResult duckpgq_plan_statement(SQLStatement &statement) {
 	if (statement.type == StatementType::CREATE_STATEMENT) {
 		auto &create_statement = statement.Cast<CreateStatement>();
+		// ALTER PROPERTY GRAPH travels as a CreateStatement whose info derives from CreatePropertyGraphInfo.
+		if (dynamic_cast<AlterPropertyGraphInfo *>(create_statement.info.get())) {
+			ParserExtensionPlanResult result;
+			result.function = AlterPropertyGraphFunction();
+			result.requires_valid_transaction = true;
+			result.return_type = StatementReturnType::QUERY_RESULT;
+			return result;
+		}
 		if (dynamic_cast<CreatePropertyGraphInfo *>(create_statement.info.get())) {
 			ParserExtensionPlanResult result;
 			result.function = CreatePropertyGraphFunction();
