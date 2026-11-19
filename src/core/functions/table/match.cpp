@@ -627,6 +627,15 @@ PathFindingCSR &PGQMatchFunction::GetPathFindingCSR(PathFindingCSRs &csrs, uniqu
                                                     const shared_ptr<PropertyGraphTable> &edge_table, bool directed,
                                                     const string &src_binding, const string &edge_binding,
                                                     const string &dst_binding) {
+	// The CSR and the path-finding functions number the vertices of one table by rowid; an edge table between two
+	// different vertex tables would mix the rowids of both.
+	if (!IsSameGraphVertexReference(*edge_table)) {
+		throw BinderException("Path-finding over edge table %s is not supported: a quantified edge needs an edge table "
+		                      "whose source and destination are the same vertex table, but %s connects %s to %s",
+		                      edge_table->table_name.GetIdentifierName(), edge_table->table_name.GetIdentifierName(),
+		                      edge_table->source_reference.GetIdentifierName(),
+		                      edge_table->destination_reference.GetIdentifierName());
+	}
 	for (auto &csr : csrs.csrs) {
 		if (csr.edge_table == edge_table && csr.directed == directed) {
 			return csr;
