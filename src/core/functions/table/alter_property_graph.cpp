@@ -1,7 +1,9 @@
 #include "duckpgq/core/functions/table/alter_property_graph.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckpgq/core/functions/table/create_property_graph.hpp"
 #include <duckpgq/core/parser/duckpgq_parser.hpp>
@@ -19,11 +21,12 @@ vector<shared_ptr<PropertyGraphTable>> &ElementTables(CreatePropertyGraphInfo &g
 	return vertex ? graph.vertex_tables : graph.edge_tables;
 }
 
-//! Element tables are named by their table name or, when the graph was created in this session, by their alias.
+//! Element tables are named by their table name. Aliases are not persisted, so they cannot name an element table
+//! reliably: another connection's ALTER, or a reload, replaces the definition with one that has none.
 shared_ptr<PropertyGraphTable> FindElementTable(CreatePropertyGraphInfo &graph, const Identifier &name, bool vertex) {
 	shared_ptr<PropertyGraphTable> result;
 	for (auto &table : ElementTables(graph, vertex)) {
-		if (table->table_name != name && (table->table_name_alias.empty() || table->table_name_alias != name)) {
+		if (table->table_name != name) {
 			continue;
 		}
 		if (result) {
@@ -37,6 +40,40 @@ shared_ptr<PropertyGraphTable> FindElementTable(CreatePropertyGraphInfo &graph, 
 		                      graph.property_graph_name);
 	}
 	return result;
+}
+
+//! Names listed in a DROP list must be distinct.
+void CheckDistinct(const vector<Identifier> &names, const char *what) {
+	for (idx_t i = 0; i < names.size(); i++) {
+		for (idx_t j = 0; j < i; j++) {
+			if (names[i] == names[j]) {
+				throw BinderException("%s %s is listed more than once", what, names[i]);
+			}
+		}
+	}
+}
+
+//! The catalog entry a table reference resolves to, or nullptr. Qualifiers are bound like DuckDB does for tables, so
+//! db2.person and memory.main.person resolve to the same entry as the bound names stored in the graph.
+optional_ptr<TableCatalogEntry> ResolveTableEntry(ClientContext &context, Identifier catalog, Identifier schema,
+                                                  const Identifier &name) {
+	try {
+		Binder::BindSchemaOrCatalog(context, catalog, schema);
+		return Catalog::GetEntry<TableCatalogEntry>(context, QualifiedName(catalog, schema, name),
+		                                            OnEntryNotFound::RETURN_NULL);
+	} catch (Exception &) {
+		return nullptr;
+	}
+}
+
+//! Whether two element tables are over the same table, however their names were qualified.
+bool SameTable(ClientContext &context, const PropertyGraphTable &left, const PropertyGraphTable &right) {
+	auto left_entry = GetPropertyGraphTableEntry(context, left);
+	auto right_entry = GetPropertyGraphTableEntry(context, right);
+	if (left_entry && right_entry) {
+		return left_entry.get() == right_entry.get();
+	}
+	return left.SameTableIdentity(right);
 }
 
 void RemoveTable(vector<shared_ptr<PropertyGraphTable>> &tables, const shared_ptr<PropertyGraphTable> &table) {
@@ -68,8 +105,9 @@ void RebuildLabelMap(CreatePropertyGraphInfo &graph) {
 }
 
 //! Links an added edge table's reference to a vertex table of the altered graph. A reference to a vertex table added
-//! by the same statement was linked by the transform; any other reference is looked up by table name or alias.
-void ResolveEdgeReference(CreatePropertyGraphInfo &graph,
+//! by the same statement (also by its alias) was linked by the transform; any other reference is resolved to its
+//! catalog entry and matched against the vertex tables of the graph.
+void ResolveEdgeReference(ClientContext &context, CreatePropertyGraphInfo &graph,
                           const unordered_map<PropertyGraphTable *, shared_ptr<PropertyGraphTable>> &added_vertices,
                           shared_ptr<PropertyGraphTable> &vertex_table, Identifier &catalog, Identifier &schema,
                           Identifier &reference) {
@@ -78,20 +116,21 @@ void ResolveEdgeReference(CreatePropertyGraphInfo &graph,
 		vertex_table = entry == added_vertices.end() ? nullptr : entry->second;
 	}
 	if (!vertex_table) {
+		auto entry = ResolveTableEntry(context, catalog, schema, reference);
 		for (auto &table : graph.vertex_tables) {
-			if ((!catalog.empty() && table->catalog_name != catalog) ||
-			    (!schema.empty() && table->schema_name != schema)) {
-				continue;
-			}
-			if (table->table_name == reference ||
-			    (!table->table_name_alias.empty() && table->table_name_alias == reference)) {
+			auto table_entry = GetPropertyGraphTableEntry(context, *table);
+			if (entry ? table_entry.get() == entry.get()
+			          : (catalog.empty() && schema.empty() && table->table_name == reference)) {
 				vertex_table = table;
 				break;
 			}
 		}
 	}
 	if (!vertex_table) {
-		return; // left as written so the validation reports the unknown reference
+		auto full_name = (catalog.empty() ? "" : catalog.GetIdentifierName() + ".") +
+		                 (schema.empty() ? "" : schema.GetIdentifierName() + ".") + reference.GetIdentifierName();
+		throw Exception(ExceptionType::INVALID,
+		                "Table '" + full_name + "' not found in the property graph " + graph.property_graph_name + ".");
 	}
 	catalog = vertex_table->catalog_name;
 	schema = vertex_table->schema_name;
@@ -110,22 +149,23 @@ void AddTables(ClientContext &context, AlterPropertyGraphInfo &info, CreatePrope
 	}
 	for (auto &edge_table : info.edge_tables) {
 		auto table = edge_table->Copy();
-		ResolveEdgeReference(graph, statement_vertices, table->source_pg_table, table->source_catalog,
+		ResolveEdgeReference(context, graph, statement_vertices, table->source_pg_table, table->source_catalog,
 		                     table->source_schema, table->source_reference);
-		ResolveEdgeReference(graph, statement_vertices, table->destination_pg_table, table->destination_catalog,
-		                     table->destination_schema, table->destination_reference);
+		ResolveEdgeReference(context, graph, statement_vertices, table->destination_pg_table,
+		                     table->destination_catalog, table->destination_schema, table->destination_reference);
 		added_edges.push_back(table);
 		graph.edge_tables.push_back(table);
 	}
 	RebuildLabelMap(graph);
 	CreatePropertyGraphFunction::ValidateTables(context, graph, added_vertices, added_edges);
-	// The stored definition identifies element tables by name, so a table can be an element of a kind only once.
+	// Element tables are named by table name (aliases are not persisted) and edges store the physical vertex name, so a
+	// table can be an element of a kind only once; a second one could not be told apart later.
 	auto check_new = [&](const vector<shared_ptr<PropertyGraphTable>> &added, bool vertex) {
 		for (auto &table : added) {
 			for (auto &other : ElementTables(graph, vertex)) {
-				if (other != table && other->SameTableIdentity(*table)) {
-					throw BinderException("Table %s is already a %s table of property graph %s", table->table_name,
-					                      ElementKind(vertex), graph.property_graph_name);
+				if (other != table && SameTable(context, *other, *table)) {
+					throw BinderException("Table %s is already %s %s table of property graph %s", table->table_name,
+					                      vertex ? "a" : "an", ElementKind(vertex), graph.property_graph_name);
 				}
 			}
 		}
@@ -135,6 +175,7 @@ void AddTables(ClientContext &context, AlterPropertyGraphInfo &info, CreatePrope
 }
 
 void DropVertexTables(AlterPropertyGraphInfo &info, CreatePropertyGraphInfo &graph) {
+	CheckDistinct(info.element_tables, "Vertex table");
 	for (auto &name : info.element_tables) {
 		auto vertex_table = FindElementTable(graph, name, true);
 		vector<shared_ptr<PropertyGraphTable>> dependents;
@@ -160,6 +201,7 @@ void DropVertexTables(AlterPropertyGraphInfo &info, CreatePropertyGraphInfo &gra
 }
 
 void DropEdgeTables(AlterPropertyGraphInfo &info, CreatePropertyGraphInfo &graph) {
+	CheckDistinct(info.element_tables, "Edge table");
 	for (auto &name : info.element_tables) {
 		RemoveTable(graph.edge_tables, FindElementTable(graph, name, false));
 	}
@@ -193,7 +235,8 @@ void AddProperties(ClientContext &context, AlterPropertyGraphInfo &info, CreateP
 			throw BinderException("Column %s not found in table %s", column, table->table_name);
 		}
 		for (idx_t j = 0; j < table->column_names.size(); j++) {
-			if (table->column_names[j] == column || table->column_aliases[j] == property) {
+			// Only property names must be unique (11.26 SR 7); a column may be exposed under several names.
+			if (table->column_aliases[j] == property) {
 				throw BinderException("Property %s is already a property of label %s", property, info.label);
 			}
 		}
@@ -204,6 +247,7 @@ void AddProperties(ClientContext &context, AlterPropertyGraphInfo &info, CreateP
 
 void DropProperties(AlterPropertyGraphInfo &info, CreatePropertyGraphInfo &graph) {
 	auto table = FindLabeledTable(info, graph);
+	CheckDistinct(info.property_names, "Property");
 	for (auto &property : info.property_names) {
 		idx_t index = 0;
 		while (index < table->column_aliases.size() && table->column_aliases[index] != property) {

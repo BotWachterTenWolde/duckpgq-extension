@@ -81,6 +81,33 @@ ALTER PROPERTY GRAPH g ADD VERTEX TABLES (city LABEL Town);
 ----
 Table "city" is already a vertex table of property graph g
 
+# Also when the table is qualified differently.
+statement error
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (main.person LABEL P2);
+----
+Table "person" is already a vertex table of property graph g
+
+statement error
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (memory.main.person LABEL P3);
+----
+Table "person" is already a vertex table of property graph g
+
+statement error
+ALTER PROPERTY GRAPH g ADD EDGE TABLES (main.knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows2);
+----
+Table "knows" is already an edge table of property graph g
+
+# Aliases are not persisted, so they do not name element tables.
+statement error
+ALTER PROPERTY GRAPH g ALTER VERTEX TABLE c ALTER LABEL City ADD PROPERTIES (name);
+----
+vertex table "c" is not part of property graph g
+
+statement error
+ALTER PROPERTY GRAPH g ADD EDGE TABLES (lives_in SOURCE KEY (person_id) REFERENCES person (id) DESTINATION KEY (city_id) REFERENCES c (id) LABEL Lives2);
+----
+Table 'c' not found in the property graph g
+
 # New element tables are validated like in CREATE PROPERTY GRAPH.
 statement error
 ALTER PROPERTY GRAPH g ADD VERTEX TABLES (nonexistent);
@@ -149,6 +176,33 @@ Property "name" is not a property of label "Person"
 
 statement ok
 ALTER PROPERTY GRAPH g ALTER VERTEX TABLE person ALTER LABEL Person ADD PROPERTIES (name);
+
+# Only property names must be unique: a column can be exposed under a second name.
+statement ok
+ALTER PROPERTY GRAPH g ALTER VERTEX TABLE person ALTER LABEL Person ADD PROPERTIES (name AS nickname);
+
+query II
+SELECT properties, column_aliases FROM __duckpgq_internal WHERE property_graph = 'g' AND table_name = 'person';
+----
+[id, age, name, name]	[id, age, name, nickname]
+
+statement error
+ALTER PROPERTY GRAPH g ALTER VERTEX TABLE person ALTER LABEL Person ADD PROPERTIES (age AS nickname);
+----
+Property "nickname" is already a property of label "Person"
+
+statement error
+ALTER PROPERTY GRAPH g ALTER VERTEX TABLE person ALTER LABEL Person DROP PROPERTIES (nickname, nickname);
+----
+Property "nickname" is listed more than once
+
+statement ok
+ALTER PROPERTY GRAPH g ALTER VERTEX TABLE person ALTER LABEL Person DROP PROPERTIES (nickname);
+
+statement error
+ALTER PROPERTY GRAPH g DROP EDGE TABLES (lives_in, lives_in);
+----
+Edge table "lives_in" is listed more than once
 
 # DROP VERTEX TABLES restricts by default while edge tables reference the vertex table.
 statement error
@@ -238,3 +292,43 @@ Incomplete edge
 
 statement ok
 DROP PROPERTY GRAPH g;
+
+# Vertex tables in an attached database: a qualified reference matches the bound names stored in the graph.
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.person(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO db2.person VALUES (1, 'Dee'), (2, 'Eve');
+
+statement ok
+CREATE TABLE db2.knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO db2.knows VALUES (1, 2);
+
+statement ok
+CREATE PROPERTY GRAPH gb VERTEX TABLES (db2.person LABEL BP);
+
+statement ok
+ALTER PROPERTY GRAPH gb ADD EDGE TABLES (db2.knows SOURCE KEY (src) REFERENCES db2.person (id) DESTINATION KEY (dst) REFERENCES db2.person (id) LABEL BK);
+
+query II
+SELECT a, b FROM GRAPH_TABLE (gb MATCH (p:BP)-[k:BK]->(q:BP) COLUMNS (p.name AS a, q.name AS b));
+----
+Dee	Eve
+
+statement error
+ALTER PROPERTY GRAPH gb ADD VERTEX TABLES (db2.main.person LABEL BP2);
+----
+Table "person" is already a vertex table of property graph gb
+
+statement error
+ALTER PROPERTY GRAPH gb ADD EDGE TABLES (db2.knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL BK2);
+----
+not found in the property graph gb
+
+statement ok
+DROP PROPERTY GRAPH gb;

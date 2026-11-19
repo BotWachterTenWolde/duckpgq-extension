@@ -63,13 +63,21 @@ ALTER PROPERTY GRAPH g ALTER {VERTEX | EDGE} TABLE t ALTER LABEL l DROP PROPERTI
 - Added element tables take the same definitions as in CREATE and are validated the same way, including the
   incomplete-edge check for added edge tables. Edge tables may reference vertex tables already in the graph. A table
   can be a vertex (or edge) table of a graph only once, and labels stay unique.
-- Element tables are named by table name, or by alias in the session that created the graph (aliases are not
-  persisted).
+- Element tables are named by their unqualified table name. Aliases are not persisted, so they do not name element
+  tables (an edge added in the same statement may still reference a vertex table added there by its alias). A
+  table qualified differently (`main.t`, `memory.main.t`) is the same table. A graph created with the same table
+  twice can be extended, but the repeated table cannot be named, so it cannot be dropped or altered.
 - `DROP VERTEX TABLES` is `RESTRICT` by default: it fails while an edge table references the vertex table. `CASCADE`
   also drops those edge tables. The last vertex table cannot be dropped; use `DROP PROPERTY GRAPH`.
 - Properties belong to the element table, so `l` may be the table's main label or one of its sublabels and the change
-  applies to all of them. `CASCADE` and `RESTRICT` on `DROP PROPERTIES` behave the same, since no graph object depends
-  on a property.
+  applies to all of them. Property names must be unique per element table; one column may be exposed under several
+  names (MATCH, however, resolves properties by column name, as for CREATE). `CASCADE` and `RESTRICT` on `DROP PROPERTIES` behave the same: dependencies of views on a property (or on
+  an element table) are not tracked, so `RESTRICT` does not fail for a view that uses it, and the view fails when it
+  is next queried. `DROP PROPERTY GRAPH` does not track views either.
+- ALTER is not transactional, like CREATE and DROP PROPERTY GRAPH: the new definition is registered in every
+  connection and written to `__duckpgq_internal` on a separate connection, so a `ROLLBACK` does not undo it, and an
+  element table over a table created in the rolled-back transaction is left dangling. Concurrent ALTERs of one graph
+  are not serialised; the last one to finish wins.
 - `ADD LABEL` and `DROP LABEL` are not supported. The statement is transformed into an `AlterPropertyGraphInfo`
   (derived from `CreatePropertyGraphInfo`) and planned onto `AlterPropertyGraphFunction`, which builds the altered
   definition from the registered graph and stores it the way `CREATE OR REPLACE` does.
