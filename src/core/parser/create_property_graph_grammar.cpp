@@ -236,6 +236,12 @@ static bool IsVertexKind(ParseResult &element_kind) {
 	return DuckPGQLiteralText(element_kind) == "VERTEX";
 }
 
+//! A BaseTableName as written: [catalog.][schema.]name.
+static QualifiedName TransformTableName(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto base_table = transformer.Transform<unique_ptr<BaseTableRef>>(parse_result);
+	return base_table->GetQualifiedName();
+}
+
 // 'ALTER' 'PROPERTY' 'GRAPH' QualifiedName DuckPGQAlterGraphAction
 static arena_ptr<TransformResultValue> TransformAlterGraph(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
@@ -264,15 +270,18 @@ static arena_ptr<TransformResultValue> TransformAlterGraph(PEGTransformer &trans
 		// References to vertex tables already in the graph stay unresolved until the statement is bound.
 		ResolveStatementTables(*info);
 	} else if (action.Name() == "DuckPGQDropElementTables") {
-		// 'DROP' DuckPGQElementKind 'TABLES' Parens(List(ColId)) DuckPGQDropBehavior?
+		// 'DROP' DuckPGQElementKind 'TABLES' Parens(List(BaseTableName)) DuckPGQDropBehavior?
 		info->action = IsVertexKind(action_list.GetChild(1)) ? AlterPropertyGraphAction::DROP_VERTEX_TABLES
 		                                                     : AlterPropertyGraphAction::DROP_EDGE_TABLES;
-		info->element_tables = TransformParensList<Identifier>(transformer, action_list.GetChild(3));
+		auto &tables = PEGTransformerFactory::ExtractResultFromParens(action_list.GetChild(3));
+		for (auto &table : PEGTransformerFactory::ExtractParseResultsFromList(tables)) {
+			info->element_tables.push_back(TransformTableName(transformer, table.get()));
+		}
 		info->cascade = IsCascade(action_list.Child<OptionalParseResult>(4));
 	} else {
-		// 'ALTER' DuckPGQElementKind 'TABLE' ColId 'ALTER' 'LABEL' ColId DuckPGQAlterLabelAction
+		// 'ALTER' DuckPGQElementKind 'TABLE' BaseTableName 'ALTER' 'LABEL' ColId DuckPGQAlterLabelAction
 		info->alter_vertex_table = IsVertexKind(action_list.GetChild(1));
-		info->element_tables.push_back(transformer.Transform<Identifier>(action_list.GetChild(3)));
+		info->element_tables.push_back(TransformTableName(transformer, action_list.GetChild(3)));
 		info->label = transformer.Transform<Identifier>(action_list.GetChild(6));
 		auto &label_action = DuckPGQGetChoice(action_list.GetChild(7));
 		auto &label_list = label_action.Cast<ListParseResult>();
@@ -284,7 +293,7 @@ static arena_ptr<TransformResultValue> TransformAlterGraph(PEGTransformer &trans
 			// 'DROP' 'PROPERTIES' Parens(List(ColId)) DuckPGQDropBehavior?
 			info->action = AlterPropertyGraphAction::DROP_PROPERTIES;
 			info->property_names = TransformParensList<Identifier>(transformer, label_list.GetChild(2));
-			// No graph object depends on a property, so CASCADE and RESTRICT behave the same.
+			// Dependencies on properties are not tracked, so CASCADE and RESTRICT behave the same.
 			info->cascade = IsCascade(label_list.Child<OptionalParseResult>(3));
 		}
 	}

@@ -325,10 +325,372 @@ ALTER PROPERTY GRAPH gb ADD VERTEX TABLES (db2.main.person LABEL BP2);
 ----
 Table "person" is already a vertex table of property graph gb
 
-statement error
-ALTER PROPERTY GRAPH gb ADD EDGE TABLES (db2.knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL BK2);
+# An unqualified reference matches the graph's vertex tables by name (11.21 SR 4b), although main.person exists.
+statement ok
+CREATE TABLE db2.likes(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO db2.likes VALUES (2, 1);
+
+statement ok
+ALTER PROPERTY GRAPH gb ADD EDGE TABLES (db2.likes SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL BL);
+
+query II
+SELECT a, b FROM GRAPH_TABLE (gb MATCH (p:BP)-[l:BL]->(q:BP) COLUMNS (p.name AS a, q.name AS b));
 ----
-not found in the property graph gb
+Eve	Dee
+
+# A qualified reference names the table it resolves to, which is not in the graph.
+statement error
+ALTER PROPERTY GRAPH gb ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES main.person (id) DESTINATION KEY (dst) REFERENCES main.person (id) LABEL K2);
+----
+Table 'main.person' not found in the property graph gb
+
+# Element tables may be named qualified in DROP and ALTER TABLE.
+statement error
+ALTER PROPERTY GRAPH gb DROP EDGE TABLES (main.likes);
+----
+edge table "likes" is not part of property graph gb
+
+statement ok
+ALTER PROPERTY GRAPH gb ALTER EDGE TABLE db2.main.likes ALTER LABEL BL DROP PROPERTIES (src);
+
+statement ok
+ALTER PROPERTY GRAPH gb DROP EDGE TABLES (db2.knows, db2.main.likes);
+
+query II
+SELECT table_name, catalog FROM __duckpgq_internal WHERE property_graph = 'gb';
+----
+person	db2
 
 statement ok
 DROP PROPERTY GRAPH gb;
+
+statement ok
+DETACH db2;
+
+# Tables with the same name in different schemas of the default database are told apart by qualification.
+statement ok
+CREATE SCHEMA s;
+
+statement ok
+CREATE TABLE s.person(id BIGINT PRIMARY KEY, name VARCHAR, age INTEGER);
+
+statement ok
+INSERT INTO s.person VALUES (7, 'Sam', 60);
+
+statement ok
+CREATE PROPERTY GRAPH gs VERTEX TABLES (person LABEL Person);
+
+statement ok
+ALTER PROPERTY GRAPH gs ADD VERTEX TABLES (s.person LABEL SPerson);
+
+statement error
+ALTER PROPERTY GRAPH gs ALTER VERTEX TABLE person ALTER LABEL Person DROP PROPERTIES (age);
+----
+vertex table name "person" is ambiguous in property graph gs; qualify it with its schema or catalog
+
+statement error
+ALTER PROPERTY GRAPH gs DROP VERTEX TABLES (person);
+----
+is ambiguous in property graph gs
+
+statement error
+ALTER PROPERTY GRAPH gs ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows);
+----
+Vertex table name "person" is ambiguous in property graph gs
+
+statement ok
+ALTER PROPERTY GRAPH gs ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES main.person (id) DESTINATION KEY (dst) REFERENCES memory.main.person (id) LABEL Knows);
+
+query II
+SELECT a, b FROM GRAPH_TABLE (gs MATCH (p:Person)-[k:Knows]->(q:Person) COLUMNS (p.name AS a, q.name AS b)) ORDER BY a;
+----
+Ann	Bob
+Bob	Cid
+
+statement ok
+ALTER PROPERTY GRAPH gs ALTER VERTEX TABLE s.person ALTER LABEL SPerson DROP PROPERTIES (age);
+
+statement ok
+ALTER PROPERTY GRAPH gs ALTER VERTEX TABLE main.person ALTER LABEL Person DROP PROPERTIES (name);
+
+query III
+SELECT table_name, schema, list_sort(properties) FROM __duckpgq_internal WHERE property_graph = 'gs' AND is_vertex_table ORDER BY schema;
+----
+person	(empty)	[age, id]
+person	s	[id, name]
+
+statement error
+ALTER PROPERTY GRAPH gs DROP VERTEX TABLES (main.person);
+----
+edge table "knows" references it
+
+statement ok
+ALTER PROPERTY GRAPH gs DROP VERTEX TABLES (s.person);
+
+# Unambiguous again, so the unqualified name works.
+statement ok
+ALTER PROPERTY GRAPH gs ALTER VERTEX TABLE person ALTER LABEL Person ADD PROPERTIES (name);
+
+statement ok
+DROP PROPERTY GRAPH gs;
+
+# An element table whose table was replaced by a view does not block other ALTERs, and can still be dropped.
+statement ok
+CREATE TABLE t1(id BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH gv VERTEX TABLES (t1 LABEL T1);
+
+statement ok
+DROP TABLE t1;
+
+statement ok
+CREATE VIEW t1 AS SELECT 1::BIGINT AS id;
+
+statement ok
+ALTER PROPERTY GRAPH gv ADD VERTEX TABLES (city LABEL City);
+
+statement error
+ALTER PROPERTY GRAPH gv ALTER VERTEX TABLE t1 ALTER LABEL T1 ADD PROPERTIES (id);
+----
+Table "t1" does not exist
+
+statement ok
+ALTER PROPERTY GRAPH gv DROP VERTEX TABLES (t1);
+
+query I
+SELECT table_name FROM __duckpgq_internal WHERE property_graph = 'gv';
+----
+city
+
+statement ok
+DROP PROPERTY GRAPH gv;
+
+statement ok
+DROP VIEW t1;
+
+# Multi-item lists, edge-table properties and CASCADE.
+statement ok
+DELETE FROM lives_in WHERE city_id = 99;
+
+statement ok
+CREATE TABLE likes(src BIGINT, dst BIGINT, since INTEGER, weight DOUBLE);
+
+statement ok
+INSERT INTO likes VALUES (1, 3, 2020, 0.5);
+
+statement ok
+CREATE PROPERTY GRAPH gm VERTEX TABLES (person PROPERTIES (id) LABEL Person);
+
+statement ok
+ALTER PROPERTY GRAPH gm ADD VERTEX TABLES (city LABEL City, s.person LABEL SPerson) ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES main.person (id) DESTINATION KEY (dst) REFERENCES main.person (id) PROPERTIES (src) LABEL Knows, likes SOURCE KEY (src) REFERENCES main.person (id) DESTINATION KEY (dst) REFERENCES main.person (id) NO PROPERTIES LABEL Likes, lives_in SOURCE KEY (person_id) REFERENCES main.person (id) DESTINATION KEY (city_id) REFERENCES city (id) LABEL LivesIn);
+
+statement ok
+ALTER PROPERTY GRAPH gm ALTER VERTEX TABLE main.person ALTER LABEL Person ADD PROPERTIES (name, age AS years);
+
+statement ok
+ALTER PROPERTY GRAPH gm ALTER EDGE TABLE likes ALTER LABEL Likes ADD PROPERTIES (since, weight);
+
+query IIII
+SELECT a, b, since, weight FROM GRAPH_TABLE (gm MATCH (p:Person)-[l:Likes]->(q:Person) COLUMNS (p.name AS a, q.name AS b, l.since, l.weight));
+----
+Ann	Cid	2020	0.5
+
+statement ok
+ALTER PROPERTY GRAPH gm ALTER EDGE TABLE likes ALTER LABEL Likes DROP PROPERTIES (since, weight) CASCADE;
+
+statement error
+SELECT * FROM GRAPH_TABLE (gm MATCH (p:Person)-[l:Likes]->(q:Person) COLUMNS (l.since));
+----
+since
+
+statement ok
+ALTER PROPERTY GRAPH gm ALTER VERTEX TABLE memory.main.person ALTER LABEL Person DROP PROPERTIES (name, years);
+
+query II
+SELECT properties, column_aliases FROM __duckpgq_internal WHERE property_graph = 'gm' AND table_name IN ('person', 'likes') AND schema = '' ORDER BY table_name;
+----
+[]	[]
+[id]	[id]
+
+statement ok
+ALTER PROPERTY GRAPH gm DROP EDGE TABLES (knows, likes) CASCADE;
+
+statement ok
+ALTER PROPERTY GRAPH gm DROP VERTEX TABLES (city, s.person) CASCADE;
+
+query III
+SELECT table_name, label, is_vertex_table FROM (DESCRIBE PROPERTY GRAPH gm) ORDER BY table_name;
+----
+person	Person	true
+
+statement ok
+DROP PROPERTY GRAPH gm;
+
+# Sublabels: ALTER LABEL may name a sublabel, labels stay unique across sublabels, and dropping the table frees them.
+statement ok
+CREATE TABLE org(id BIGINT PRIMARY KEY, name VARCHAR, typemask INTEGER, country VARCHAR);
+
+statement ok
+INSERT INTO org VALUES (1, 'TU Delft', 2, 'NL'), (2, 'Acme', 1, 'US');
+
+statement ok
+CREATE PROPERTY GRAPH gl VERTEX TABLES (person LABEL Person);
+
+statement ok
+ALTER PROPERTY GRAPH gl ADD VERTEX TABLES (org PROPERTIES (id, name, typemask) LABEL Organisation IN typemask(company, university));
+
+statement error
+ALTER PROPERTY GRAPH gl ADD VERTEX TABLES (city LABEL university);
+----
+Label university is not unique
+
+statement ok
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE org ALTER LABEL university ADD PROPERTIES (country);
+
+query II
+SELECT name, country FROM GRAPH_TABLE (gl MATCH (o:Organisation) COLUMNS (o.name, o.country)) ORDER BY name;
+----
+Acme	US
+TU Delft	NL
+
+statement ok
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE org ALTER LABEL company DROP PROPERTIES (country);
+
+statement error
+SELECT * FROM GRAPH_TABLE (gl MATCH (o:Organisation) COLUMNS (o.country));
+----
+country
+
+statement ok
+ALTER PROPERTY GRAPH gl DROP VERTEX TABLES (org);
+
+statement ok
+ALTER PROPERTY GRAPH gl ADD VERTEX TABLES (city LABEL university);
+
+statement ok
+DROP PROPERTY GRAPH gl;
+
+# A qualified graph name.
+statement ok
+CREATE PROPERTY GRAPH gq VERTEX TABLES (person LABEL Person);
+
+statement ok
+ALTER PROPERTY GRAPH memory.main.gq ADD VERTEX TABLES (city LABEL City);
+
+statement ok
+ALTER PROPERTY GRAPH main.gq ALTER VERTEX TABLE city ALTER LABEL City DROP PROPERTIES (id);
+
+query II
+SELECT table_name, list_sort(properties) FROM __duckpgq_internal WHERE property_graph = 'gq' ORDER BY table_name;
+----
+city	[name]
+person	[age, id, name]
+
+# ALTER from a second connection is visible in the first one.
+statement ok con2
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok con2
+ALTER PROPERTY GRAPH gq ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows);
+
+query II
+SELECT a, b FROM GRAPH_TABLE (gq MATCH (p:Person)-[k:Knows]->(q:Person) COLUMNS (p.name AS a, q.name AS b)) ORDER BY a;
+----
+Ann	Bob
+Bob	Cid
+
+statement ok
+ALTER PROPERTY GRAPH gq DROP EDGE TABLES (knows);
+
+statement error con2
+SELECT * FROM GRAPH_TABLE (gq MATCH (p:Person)-[k:Knows]->(q:Person));
+----
+The label Knows is not registered in property graph gq
+
+# ALTER is not transactional (see docs/GRAMMAR_EXTENSION.md): ROLLBACK does not undo it.
+statement ok
+BEGIN;
+
+statement ok
+ALTER PROPERTY GRAPH gq DROP VERTEX TABLES (city);
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT table_name FROM __duckpgq_internal WHERE property_graph = 'gq';
+----
+person
+
+# The verified flag: an edge table that cannot be checked (created in an open transaction, so invisible to the
+# connection that checks it) makes the graph unverified; the graph is checked as a whole again on the next ALTER.
+query I
+SELECT DISTINCT verified FROM __duckpgq_internal WHERE property_graph = 'gq';
+----
+true
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE follows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO follows VALUES (1, 2);
+
+statement ok
+ALTER PROPERTY GRAPH gq ADD EDGE TABLES (follows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Follows);
+
+statement ok
+COMMIT;
+
+query I
+SELECT DISTINCT verified FROM __duckpgq_internal WHERE property_graph = 'gq';
+----
+false
+
+statement ok
+ALTER PROPERTY GRAPH gq ADD VERTEX TABLES (city LABEL City);
+
+query I
+SELECT DISTINCT verified FROM __duckpgq_internal WHERE property_graph = 'gq';
+----
+true
+
+# An incomplete edge in an existing edge table keeps an unverified graph unverified without failing the ALTER.
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE blocks(src BIGINT, dst BIGINT);
+
+statement ok
+ALTER PROPERTY GRAPH gq ADD EDGE TABLES (blocks SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Blocks);
+
+statement ok
+COMMIT;
+
+statement ok
+INSERT INTO follows VALUES (1, 99);
+
+statement ok
+ALTER PROPERTY GRAPH gq DROP EDGE TABLES (blocks);
+
+query I
+SELECT DISTINCT verified FROM __duckpgq_internal WHERE property_graph = 'gq';
+----
+false
+
+statement ok
+ALTER PROPERTY GRAPH gq DROP EDGE TABLES (follows);
+
+query I
+SELECT DISTINCT verified FROM __duckpgq_internal WHERE property_graph = 'gq';
+----
+true
+
+statement ok
+DROP PROPERTY GRAPH gq;

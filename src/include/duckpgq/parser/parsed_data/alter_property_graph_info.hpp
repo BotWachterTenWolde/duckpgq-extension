@@ -34,8 +34,9 @@ struct AlterPropertyGraphInfo : public CreatePropertyGraphInfo {
 	}
 
 	AlterPropertyGraphAction action = AlterPropertyGraphAction::ADD_TABLES;
-	//! DROP ... TABLES: the element tables to drop. ALTER ... TABLE: the one element table to alter.
-	vector<Identifier> element_tables;
+	//! DROP ... TABLES: the element tables to drop. ALTER ... TABLE: the one element table to alter. As written,
+	//! possibly qualified.
+	vector<QualifiedName> element_tables;
 	//! ALTER {VERTEX | EDGE} TABLE: whether a vertex table is altered.
 	bool alter_vertex_table = true;
 	//! ALTER LABEL: the label whose properties change.
