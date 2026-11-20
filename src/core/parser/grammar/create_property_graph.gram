@@ -31,3 +31,16 @@ DuckPGQSourceReference <- 'SOURCE' DuckPGQReference
 DuckPGQDestinationReference <- 'DESTINATION' DuckPGQReference
 DuckPGQReference <- DuckPGQKeyReference / BaseTableName
 DuckPGQKeyReference <- 'KEY' Parens(List(ColId)) 'REFERENCES' BaseTableName Parens(List(ColId))
+
+# ALTER PROPERTY GRAPH (ISO/IEC 9075-16, 11.20). Element tables are named by their (optionally qualified) table name.
+DuckPGQAlterPropertyGraph <- 'ALTER' 'PROPERTY' 'GRAPH' QualifiedName DuckPGQAlterGraphAction
+DuckPGQAlterGraphAction <- DuckPGQAddVertexTables / DuckPGQAddEdgeTables / DuckPGQDropElementTables / DuckPGQAlterElementTable
+DuckPGQAddVertexTables <- 'ADD' DuckPGQVertexTables DuckPGQAddEdgeTables?
+DuckPGQAddEdgeTables <- 'ADD' DuckPGQEdgeTables
+DuckPGQDropElementTables <- 'DROP' DuckPGQElementKind 'TABLES' Parens(List(BaseTableName)) DuckPGQDropBehavior?
+DuckPGQAlterElementTable <- 'ALTER' DuckPGQElementKind 'TABLE' BaseTableName 'ALTER' 'LABEL' ColId DuckPGQAlterLabelAction
+DuckPGQAlterLabelAction <- DuckPGQAddLabelProperties / DuckPGQDropLabelProperties
+DuckPGQAddLabelProperties <- 'ADD' 'PROPERTIES' Parens(List(DuckPGQProperty))
+DuckPGQDropLabelProperties <- 'DROP' 'PROPERTIES' Parens(List(ColId)) DuckPGQDropBehavior?
+DuckPGQElementKind <- 'VERTEX' / 'EDGE'
+DuckPGQDropBehavior <- 'CASCADE' / 'RESTRICT'

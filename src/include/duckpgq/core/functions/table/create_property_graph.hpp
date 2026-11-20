@@ -60,6 +60,21 @@ public:
 	static void ValidateForeignKeyColumns(shared_ptr<PropertyGraphTable> &edge_table,
 	                                      const vector<Identifier> &fk_columns, optional_ptr<TableCatalogEntry> &table);
 
+	//! Binds the given element tables of [info] and checks their columns, labels and keys. Edge tables may reference
+	//! any vertex table of [info].
+	static void ValidateTables(ClientContext &context, CreatePropertyGraphInfo &info,
+	                           vector<shared_ptr<PropertyGraphTable>> &vertex_tables,
+	                           vector<shared_ptr<PropertyGraphTable>> &edge_tables);
+
+	//! Checks that every key of the edge table references a vertex row. Returns false when the data could not be read.
+	static bool VerifyEdgeTable(ClientContext &context, Connection &connection,
+	                            const shared_ptr<PropertyGraphTable> &edge_table);
+
+	//! Registers the graph in every connection and persists it in __duckpgq_internal, replacing the stored rows of a
+	//! graph with the same name when [replace_existing] is set.
+	static void StorePropertyGraph(ClientContext &context, Connection &connection, CreatePropertyGraphInfo &info,
+	                               bool replace_existing);
+
 	static unique_ptr<GlobalTableFunctionState> CreatePropertyGraphInit(ClientContext &context,
 	                                                                    TableFunctionInitInput &input);
 

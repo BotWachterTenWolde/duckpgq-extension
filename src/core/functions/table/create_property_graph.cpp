@@ -240,8 +240,14 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		                "Property graph table with name " + info->property_graph_name + " already exists");
 	}
 
-	case_insensitive_set_t v_table_names;
-	for (auto &vertex_table : info->vertex_tables) {
+	ValidateTables(context, *info, info->vertex_tables, info->edge_tables);
+	return make_uniq<CreatePropertyGraphBindData>(info);
+}
+
+void CreatePropertyGraphFunction::ValidateTables(ClientContext &context, CreatePropertyGraphInfo &info,
+                                                 vector<shared_ptr<PropertyGraphTable>> &vertex_tables,
+                                                 vector<shared_ptr<PropertyGraphTable>> &edge_tables) {
+	for (auto &vertex_table : vertex_tables) {
 		try {
 			BindPropertyGraphTable(context, vertex_table);
 
@@ -263,13 +269,18 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		} catch (BinderException &e) {
 			throw Exception(ExceptionType::INVALID, "Catalog '" + vertex_table->catalog_name + "' does not exist!");
 		}
+	}
+
+	// Edge tables may reference every vertex table of the graph, including ones that were not validated here.
+	case_insensitive_set_t v_table_names;
+	for (auto &vertex_table : info.vertex_tables) {
 		v_table_names.insert(vertex_table->FullTableName());
 		if (vertex_table->hasTableNameAlias()) {
 			v_table_names.insert(vertex_table->table_name_alias.GetIdentifierName());
 		}
 	}
 
-	for (auto &edge_table : info->edge_tables) {
+	for (auto &edge_table : edge_tables) {
 		try {
 			BindPropertyGraphTable(context, edge_table);
 			auto table = GetPropertyGraphTable(context, edge_table);
@@ -303,7 +314,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 
 			// Validate source table registration
 			if (!edge_table->source_pg_table) {
-				ThrowMissingVertexReference(*info, edge_table->source_catalog, edge_table->source_schema,
+				ThrowMissingVertexReference(info, edge_table->source_catalog, edge_table->source_schema,
 				                            edge_table->source_reference);
 			}
 			ValidateVertexTableRegistration(edge_table->source_pg_table, v_table_names);
@@ -313,7 +324,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 
 			// Validate destination table registration
 			if (!edge_table->destination_pg_table) {
-				ThrowMissingVertexReference(*info, edge_table->destination_catalog, edge_table->destination_schema,
+				ThrowMissingVertexReference(info, edge_table->destination_catalog, edge_table->destination_schema,
 				                            edge_table->destination_reference);
 			}
 			ValidateVertexTableRegistration(edge_table->destination_pg_table, v_table_names);
@@ -332,7 +343,6 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 			throw Exception(ExceptionType::INVALID, "Catalog '" + edge_table->catalog_name + "' does not exist!");
 		}
 	}
-	return make_uniq<CreatePropertyGraphBindData>(info);
 }
 
 //! The check runs on a separate connection, so the table is named by the catalog entry it resolved to in the user's
@@ -472,14 +482,26 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 	// keeps the previous definition.
 	pg_info->verified = true;
 	for (auto &edge_table : pg_info->edge_tables) {
-		pg_info->verified &=
-		    CheckEdgeKeysReferenceVertices(context, *new_conn, edge_table, "source", edge_table->source_fk,
-		                                   edge_table->source_pg_table, edge_table->source_pk);
-		pg_info->verified &=
-		    CheckEdgeKeysReferenceVertices(context, *new_conn, edge_table, "destination", edge_table->destination_fk,
-		                                   edge_table->destination_pg_table, edge_table->destination_pk);
+		pg_info->verified &= VerifyEdgeTable(context, *new_conn, edge_table);
 	}
+	StorePropertyGraph(context, *new_conn, *pg_info, replace_existing);
+}
 
+bool CreatePropertyGraphFunction::VerifyEdgeTable(ClientContext &context, Connection &connection,
+                                                  const shared_ptr<PropertyGraphTable> &edge_table) {
+	auto source_verified =
+	    CheckEdgeKeysReferenceVertices(context, connection, edge_table, "source", edge_table->source_fk,
+	                                   edge_table->source_pg_table, edge_table->source_pk);
+	auto destination_verified =
+	    CheckEdgeKeysReferenceVertices(context, connection, edge_table, "destination", edge_table->destination_fk,
+	                                   edge_table->destination_pg_table, edge_table->destination_pk);
+	return source_verified && destination_verified;
+}
+
+void CreatePropertyGraphFunction::StorePropertyGraph(ClientContext &context, Connection &connection,
+                                                     CreatePropertyGraphInfo &info, bool replace_existing) {
+	auto pg_info = &info;
+	auto new_conn = &connection;
 	for (auto &local_client_context : ConnectionManager::Get(*context.db).GetConnectionList()) {
 		auto local_state = GetDuckPGQState(*local_client_context);
 		local_state->registered_property_graphs[pg_info->property_graph_name] = pg_info->Copy();
